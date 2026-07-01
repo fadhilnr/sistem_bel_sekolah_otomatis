@@ -1,0 +1,210 @@
+#define BLYNK_TEMPLATE_ID   "TMPL6LpxC6Ceh"
+#define BLYNK_TEMPLATE_NAME "BelSekolah"
+#define BLYNK_AUTH_TOKEN    "DXk3-J1qZxyhM6e6ZyodCEgAk4JVZiLo"
+
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+#include <Wire.h>
+#include <RTClib.h>
+#include <LiquidCrystal_I2C.h>
+
+char ssid[] = "Wokwi-GUEST";
+char pass[] = "";
+
+RTC_DS1307 rtc;
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+#define PIN_BUZZER 5
+#define PIN_LED    4
+#define JUMLAH_JADWAL 7
+
+// Jadwal disimpan sebagai jam & menit
+int jadwalJam[JUMLAH_JADWAL]   = {7,  8,  10, 10, 12, 12, 14};
+int jadwalMenit[JUMLAH_JADWAL] = {0,  30, 0,  15, 0,  30, 0};
+String jadwalNama[JUMLAH_JADWAL] = {
+  "Masuk Pagi", "Ganti Jam", "Istirahat 1",
+  "Masuk", "Istirahat 2", "Masuk", "Pulang"
+};
+bool sudahBunyi[JUMLAH_JADWAL] = {false};
+
+bool belSedangBunyi = false;
+unsigned long waktuMulaiBel = 0;
+int durasiAktif = 0;
+
+BlynkTimer timer;
+
+// =============================================
+// PARSING "HH:MM" dari Blynk
+// =============================================
+void parseJadwal(String val, int index) {
+  val.trim();
+  int colon = val.indexOf(':');
+  if (colon > 0) {
+    int j = val.substring(0, colon).toInt();
+    int m = val.substring(colon + 1).toInt();
+    if (j >= 0 && j <= 23 && m >= 0 && m <= 59) {
+      jadwalJam[index]   = j;
+      jadwalMenit[index] = m;
+      sudahBunyi[index]  = false; // reset flag saat jadwal diubah
+      Serial.println("Jadwal " + String(index+1) + " diupdate: " + val);
+    }
+  }
+}
+
+// =============================================
+// BLYNK_WRITE untuk tiap Virtual Pin jadwal
+// =============================================
+BLYNK_WRITE(V3)  { parseJadwal(param.asStr(), 0); }
+BLYNK_WRITE(V4)  { parseJadwal(param.asStr(), 1); }
+BLYNK_WRITE(V5)  { parseJadwal(param.asStr(), 2); }
+BLYNK_WRITE(V6)  { parseJadwal(param.asStr(), 3); }
+BLYNK_WRITE(V7)  { parseJadwal(param.asStr(), 4); }
+BLYNK_WRITE(V8)  { parseJadwal(param.asStr(), 5); }
+BLYNK_WRITE(V9)  { parseJadwal(param.asStr(), 6); }
+
+// Tombol manual
+BLYNK_WRITE(V1) {
+  if (param.asInt() == 1) {
+    aktifkanBel(2, "Manual");
+    lcd.setCursor(0, 1);
+    lcd.print(">> Bel Manual   ");
+  }
+}
+
+// =============================================
+// AKTIFKAN & MATIKAN BEL
+// =============================================
+void aktifkanBel(int durasi, String nama) {
+  belSedangBunyi = true;
+  waktuMulaiBel  = millis();
+  durasiAktif    = durasi;
+  digitalWrite(PIN_BUZZER, HIGH);
+  digitalWrite(PIN_LED, HIGH);
+  Blynk.virtualWrite(V2, 1);
+  Blynk.logEvent("bel_bunyi", "Bel " + nama + " berbunyi!");
+}
+
+void matikanBel() {
+  belSedangBunyi = false;
+  digitalWrite(PIN_BUZZER, LOW);
+  digitalWrite(PIN_LED, LOW);
+  Blynk.virtualWrite(V2, 0);
+}
+
+// =============================================
+// KIRIM JADWAL KE BLYNK (saat pertama konek)
+// =============================================
+BLYNK_CONNECTED() {
+  Blynk.syncVirtual(V3, V4, V5, V6, V7, V8, V9);
+}
+
+// =============================================
+// CEK JADWAL & UPDATE DISPLAY
+// =============================================
+String cariJadwalBerikutnya(int jam, int menit) {
+  for (int i = 0; i < JUMLAH_JADWAL; i++) {
+    if (jadwalJam[i] > jam ||
+       (jadwalJam[i] == jam && jadwalMenit[i] > menit)) {
+      String s = "";
+      if (jadwalJam[i] < 10) s += "0";
+      s += String(jadwalJam[i]) + ":";
+      if (jadwalMenit[i] < 10) s += "0";
+      s += String(jadwalMenit[i]);
+      return s;
+    }
+  }
+  return "07:00";
+}
+
+void cekJadwalDanUpdate() {
+  DateTime now = rtc.now();
+  int j = now.hour();
+  int m = now.minute();
+  int d = now.second();
+
+  // Tampilkan jam di LCD baris 1
+  lcd.setCursor(0, 0);
+  lcd.print("Jam: ");
+  if (j < 10) lcd.print("0"); lcd.print(j);
+  lcd.print(":");
+  if (m < 10) lcd.print("0"); lcd.print(m);
+  lcd.print(":");
+  if (d < 10) lcd.print("0"); lcd.print(d);
+  lcd.print("  ");
+
+  // Kirim jam ke Blynk V0
+  String waktuStr = "";
+  if (j < 10) waktuStr += "0";
+  waktuStr += String(j) + ":";
+  if (m < 10) waktuStr += "0";
+  waktuStr += String(m) + ":";
+  if (d < 10) waktuStr += "0";
+  waktuStr += String(d);
+  Blynk.virtualWrite(V0, waktuStr);
+
+  // Cek jadwal — toleransi 10 detik agar tidak kelewat saat lag
+  for (int i = 0; i < JUMLAH_JADWAL; i++) {
+    if (j == jadwalJam[i] &&
+        m == jadwalMenit[i] &&
+        d <= 10 &&
+        !sudahBunyi[i]) {
+      aktifkanBel(2, jadwalNama[i]);
+      sudahBunyi[i] = true;
+      lcd.setCursor(0, 1);
+      lcd.print(">> ");
+      lcd.print(jadwalNama[i]);
+      lcd.print("         ");
+    }
+  }
+
+  // Tampilkan jadwal berikutnya saat bel tidak bunyi
+  if (!belSedangBunyi) {
+    lcd.setCursor(0, 1);
+    lcd.print("Next:");
+    lcd.print(cariJadwalBerikutnya(j, m));
+    lcd.print("    ");
+  }
+}
+
+void resetFlag() {
+  for (int i = 0; i < JUMLAH_JADWAL; i++) sudahBunyi[i] = false;
+}
+
+// =============================================
+// SETUP & LOOP
+// =============================================
+void setup() {
+  Serial.begin(115200);
+  pinMode(PIN_BUZZER, OUTPUT);
+  pinMode(PIN_LED, OUTPUT);
+  digitalWrite(PIN_BUZZER, LOW);
+  digitalWrite(PIN_LED, LOW);
+
+  Wire.begin(21, 22);
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("Bel Sekolah v2.0");
+  lcd.setCursor(0, 1);
+  lcd.print("Connecting...");
+
+  if (!rtc.begin()) {
+    lcd.print("RTC Error!");
+    while (1);
+  }
+  // rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+  timer.setInterval(1000L, cekJadwalDanUpdate);
+  timer.setInterval(86400000L, resetFlag);
+}
+
+void loop() {
+  timer.run();
+  Blynk.run();
+
+  if (belSedangBunyi &&
+     (millis() - waktuMulaiBel >= durasiAktif * 1000UL)) {
+    matikanBel();
+  }
+}
